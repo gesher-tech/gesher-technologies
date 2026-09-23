@@ -38,8 +38,7 @@ jobs:
       SSH_USER: ${{ secrets.SSH_USER }}
       SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
       SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
-      # Hostinger document root for the domain.
-      DEPLOY_PATH: /home/${{ secrets.SSH_USER }}/domains/geshertech.com/public_html
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
       SITE_URL: ${{ vars.SITE_URL || 'https://geshertech.com' }}
     steps:
       - name: Validate configuration
@@ -52,8 +51,7 @@ jobs:
           [ "$missing" -eq 0 ] || exit 1
           # Secrets pasted into the GitHub UI often carry stray spaces or newlines; strip them once here.
           trim() { printf '%s' "$1" | tr -d '[:space:]'; }
-          SSH_HOST="$(trim "$SSH_HOST")"; SSH_PORT="$(trim "$SSH_PORT")"; SSH_USER="$(trim "$SSH_USER")"
-          DEPLOY_PATH="/home/$SSH_USER/domains/geshertech.com/public_html"
+          SSH_HOST="$(trim "$SSH_HOST")"; SSH_PORT="$(trim "$SSH_PORT")"; SSH_USER="$(trim "$SSH_USER")";DEPLOY_PATH="$(trim "$DEPLOY_PATH")"
           case "$SSH_PORT" in ''|*[!0-9]*) echo "::error::SSH_PORT must be a number."; exit 1 ;; esac
           {
             echo "SSH_HOST=$SSH_HOST"
