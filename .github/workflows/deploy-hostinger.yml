@@ -1,0 +1,160 @@
+name: Deploy to Hostinger
+
+# Continuous deployment over SSH:
+#   - push to main  -> CI passes -> the exact build CI tested is uploaded to public_html
+#   - manual run    -> builds main and deploys it (Actions tab -> "Deploy to Hostinger" -> Run workflow)
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read # download the build artifact from the CI run
+
+# Deploys run one at a time and are never cancelled halfway.
+concurrency:
+  group: deploy-hostinger
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to production
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: production
+      url: ${{ vars.SITE_URL }}
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT || '65002' }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+      # Hostinger document root for the domain.
+      DEPLOY_PATH: /home/${{ secrets.SSH_USER }}/domains/geshertech.com/public_html
+      SITE_URL: ${{ vars.SITE_URL || 'https://geshertech.com' }}
+    steps:
+      - name: Validate configuration
+        run: |
+          missing=0
+          for pair in SSH_HOST:SSH_HOST SSH_USER:SSH_USER SSH_KEY:SSH_PRIVATE_KEY; do
+            var="${pair%%:*}"; secret="${pair#*:}"
+            if [ -z "${!var}" ]; then echo "::error::Repository secret $secret is not set."; missing=1; fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          # rsync --delete below mirrors the build into DEPLOY_PATH, so refuse anything outside public_html.
+          case "${DEPLOY_PATH%/}" in
+            *public_html|*public_html/*) ;;
+            *) echo "::error::DEPLOY_PATH must point to public_html (got '$DEPLOY_PATH')."; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      # Automatic deploys reuse the artifact CI built and checked (tests, typecheck, .htaccess).
+      - name: Download tested build from CI
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      # Manual deploys build main from scratch.
+      - name: Set up Node
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Build
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          npm ci
+          npm run build
+
+      - name: Verify build output
+        run: |
+          test -f dist/index.html || { echo "::error::dist/index.html missing"; exit 1; }
+          test -f dist/.htaccess || { echo "::error::dist/.htaccess missing — the site would lose its rewrites and security headers"; exit 1; }
+          echo "Deploying $(find dist -type f | wc -l) files ($(du -sh dist | cut -f1))"
+
+      - name: Configure SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/hostinger
+          chmod 600 ~/.ssh/hostinger
+          if [ -n "$SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            echo "::warning::SSH_KNOWN_HOSTS is not set; trusting the host key found by ssh-keyscan. Add the secret to pin it."
+            ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" > ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 600 ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host hostinger
+            HostName $SSH_HOST
+            Port $SSH_PORT
+            User $SSH_USER
+            IdentityFile ~/.ssh/hostinger
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            ServerAliveInterval 15
+          EOF
+
+      - name: Preflight (connection, rsync, target folder)
+        run: |
+          # DEPLOY_PATH is expanded here on the runner on purpose.
+          # shellcheck disable=SC2029
+          ssh hostinger "command -v rsync >/dev/null || { echo 'rsync is not available on the server' >&2; exit 1; }
+                         mkdir -p '${DEPLOY_PATH%/}' && test -w '${DEPLOY_PATH%/}' && echo \"Connected as \$(whoami); target: ${DEPLOY_PATH%/}\""
+
+      - name: Back up current site
+        run: |
+          # Keeps the last 5 versions in ~/deploy-backups for a quick manual rollback.
+          # shellcheck disable=SC2029
+          ssh hostinger "set -e
+            mkdir -p ~/deploy-backups
+            if [ -n \"\$(ls -A '${DEPLOY_PATH%/}' 2>/dev/null)\" ]; then
+              tar -czf ~/deploy-backups/public_html-\$(date +%Y%m%d-%H%M%S).tar.gz -C '${DEPLOY_PATH%/}' .
+            fi
+            ls -1t ~/deploy-backups/public_html-*.tar.gz 2>/dev/null | tail -n +6 | xargs -r rm -f
+            echo \"Backups: \$(ls ~/deploy-backups | wc -l)\""
+
+      - name: Upload with rsync
+        run: |
+          target="hostinger:${DEPLOY_PATH%/}/"
+          opts=(-rlz --checksum "--chmod=D755,F644")
+          # 1) New hashed assets first, so the live index.html never points to missing files.
+          rsync "${opts[@]}" --exclude=index.html dist/ "$target"
+          # 2) Switch over to the new version.
+          rsync "${opts[@]}" dist/index.html "$target"
+          # 3) Remove files from older builds. .well-known (SSL validation) is never touched.
+          rsync "${opts[@]}" --delete --filter='P .well-known/' dist/ "$target"
+
+      - name: Smoke test
+        if: env.SITE_URL != ''
+        run: |
+          url="${SITE_URL%/}"
+          html=$(curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors "$url/")
+          grep -q 'id="root"' <<<"$html" || { echo "::error::$url/ did not return the app"; exit 1; }
+          asset=$(grep -oE '/assets/[^"]+\.js' <<<"$html" | head -1)
+          type=$(curl -fsSI "$url$asset" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-type"{print $2}')
+          case "$type" in *javascript*) ;; *) echo "::error::$asset served as '$type'"; exit 1 ;; esac
+          curl -fsSI "$url/" | tr -d '\r' | grep -qi '^content-security-policy:' || echo "::warning::Security headers missing — is mod_headers enabled?"
+          echo "### Deployed to $url" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove SSH key
+        if: always()
+        run: rm -rf ~/.ssh

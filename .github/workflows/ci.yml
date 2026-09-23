@@ -69,7 +69,26 @@ jobs:
       - name: Upload build output
         uses: actions/upload-artifact@v7
         with:
-          name: dist-${{ github.sha }}
+          # The deploy workflow downloads this exact artifact, so production gets the tested build.
+          name: dist
           path: dist
+          # Required: .htaccess is a dotfile and would otherwise be left out.
+          include-hidden-files: true
           retention-days: 7
           if-no-files-found: error
+
+  htaccess:
+    name: Apache .htaccess
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist
+
+      - name: Check rewrites, headers and caching on Apache httpd 2.4
+        run: bash scripts/check-htaccess.sh dist
