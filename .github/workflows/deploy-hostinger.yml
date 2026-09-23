@@ -50,6 +50,17 @@ jobs:
             if [ -z "${!var}" ]; then echo "::error::Repository secret $secret is not set."; missing=1; fi
           done
           [ "$missing" -eq 0 ] || exit 1
+          # Secrets pasted into the GitHub UI often carry stray spaces or newlines; strip them once here.
+          trim() { printf '%s' "$1" | tr -d '[:space:]'; }
+          SSH_HOST="$(trim "$SSH_HOST")"; SSH_PORT="$(trim "$SSH_PORT")"; SSH_USER="$(trim "$SSH_USER")"
+          DEPLOY_PATH="/home/$SSH_USER/domains/geshertech.com/public_html"
+          case "$SSH_PORT" in ''|*[!0-9]*) echo "::error::SSH_PORT must be a number."; exit 1 ;; esac
+          {
+            echo "SSH_HOST=$SSH_HOST"
+            echo "SSH_PORT=$SSH_PORT"
+            echo "SSH_USER=$SSH_USER"
+            echo "DEPLOY_PATH=$DEPLOY_PATH"
+          } >> "$GITHUB_ENV"
           # rsync --delete below mirrors the build into DEPLOY_PATH, so refuse anything outside public_html.
           case "${DEPLOY_PATH%/}" in
             *public_html|*public_html/*) ;;
@@ -96,7 +107,19 @@ jobs:
           printf '%s\n' "$SSH_KEY" > ~/.ssh/hostinger
           chmod 600 ~/.ssh/hostinger
           if [ -n "$SSH_KNOWN_HOSTS" ]; then
-            printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+            # Accepts raw `ssh-keyscan` output (comments, Windows line endings, IP or hostname labels).
+            # Each key is re-labelled for the exact [host]:port used below, so a label mismatch can't
+            # break the connection — while the key itself must still match the server's.
+            printf '%s\n' "$SSH_KNOWN_HOSTS" | tr -d '\r' | awk -v target="[$SSH_HOST]:$SSH_PORT" '
+              /^[[:space:]]*(#|$)/ { next }
+              { for (i = 1; i < NF; i++) if ($i ~ /^(ssh-|ecdsa-|sk-)/) { print target, $i, $(i + 1); break } }
+            ' > ~/.ssh/known_hosts
+            keys=$(wc -l < ~/.ssh/known_hosts)
+            if [ "$keys" -eq 0 ] || ! ssh-keygen -F "[$SSH_HOST]:$SSH_PORT" -f ~/.ssh/known_hosts >/dev/null; then
+              echo "::error::SSH_KNOWN_HOSTS contains no usable host keys. Paste the output of: ssh-keyscan -p <port> <host>"
+              exit 1
+            fi
+            echo "Pinned $keys server host key(s)."
           else
             echo "::warning::SSH_KNOWN_HOSTS is not set; trusting the host key found by ssh-keyscan. Add the secret to pin it."
             ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" > ~/.ssh/known_hosts 2>/dev/null
